@@ -1,0 +1,11 @@
+<%#
+kind: PXELinux
+name: pfSense (mfsBSD) PXELinux
+oses:
+- pfSense 2.1.4
+%>
+# foreman_url=<%= foreman_url %>
+default freebsd
+label freebsd
+kernel memdisk
+append initrd=boot/FreeBSD-x86_64-10.0-mfs.img harddisk raw
