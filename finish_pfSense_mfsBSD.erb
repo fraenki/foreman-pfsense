@@ -1,0 +1,83 @@
+<%#
+kind: finish
+name: pfSense (mfsBSD) finish
+oses:
+- pfSense 2.1.4
+%>
+<%
+  # safemode renderer does not support unary negation
+  pm_set = @host.puppetmaster.empty? ? false : true
+  puppet_enabled = pm_set || @host.params['force-puppet']
+%>
+
+<% if puppet_enabled %>
+cat > /tmp/configure-puppet.php << "CFGPUPPET"
+#!/usr/local/bin/php -q
+<?php
+
+$file = '/cf/conf/config.xml';
+$xml = simplexml_load_file($file) or die("Failed to load XML configuration\n");
+
+// XXX: puppet is not yet available from the official pfSense repo
+$system = $xml->xpath('/pfsense/system');
+$repo = $system[0]->addChild('altpkgrepo');
+$repo->addChild('enable');
+$repo->addChild('xmlrpcbaseurl', 'pfsense.moov.de');
+
+$xml->installedpackages->puppet->config->enable = 'on';
+$xml->installedpackages->puppet->config->server = '<%= @host.puppetmaster %>';
+$xml->installedpackages->puppet->config->environment = '<%= @host.environment %>';
+$xml->installedpackages->puppet->config->configtimeout = '4';
+
+$dom = new DOMDocument('1.0');
+$dom->preserveWhiteSpace = false;
+$dom->formatOutput = true;
+$dom->loadXML($xml->asXML());
+$output = $dom->saveXML();
+file_put_contents($file, $output, LOCK_EX) or die("Failed to save XML configuration\n");
+
+exit;
+?>
+CFGPUPPET
+chmod 755 /tmp/configure-puppet.php
+if [ ! -e /tmp/puppet-configured ]; then
+  touch /tmp/puppet-configured
+  /tmp/configure-puppet.php || exit 1
+  rm -f /tmp/config.cache
+fi
+# give pfSense some time on first boot
+sleep 60
+/usr/local/sbin/pfsense_pkg action=install pkg=Puppet >/tmp/puppet_install.log 2>&1 || exit 1
+
+cat > /tmp/run-puppet.php << "RUNPUPPET"
+#!/usr/local/bin/php -q
+<?php
+
+require_once("/etc/inc/config.inc");
+require_once("/etc/inc/config.lib.inc");
+require_once("/etc/inc/util.inc");
+require_once("/etc/inc/pfsense-utils.inc");
+require_once("/etc/inc/service-utils.inc");
+require_once("/usr/local/pkg/puppet.inc");
+
+sync_package_puppet();
+
+if (is_service_running('puppet')) {
+  echo 'puppet is running\n';
+} else {
+  echo 'puppet is NOT running\n';
+}
+
+exit;
+?>
+RUNPUPPET
+chmod 755 /tmp/run-puppet.php
+/tmp/run-puppet.php >/tmp/puppet_status.log 2>&1 || exit 1
+<% end -%>
+
+# remove finish script
+/usr/bin/sed -i '' "s@<shellcmd>/bin/sh /etc/rc.foreman</shellcmd>@@g" /cf/conf/config.xml || exit 1
+rm -f /tmp/config.cache
+rm -f /etc/rc.foreman
+
+exit 0

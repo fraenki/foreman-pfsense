@@ -1,0 +1,523 @@
+<%#
+kind: provision
+name: pfSense (mfsBSD) provision
+oses:
+- pfSense 2.1.4
+%>
+# host configuration @foreman
+timezone="<%= @host.params['time-zone'] || 'Etc/UTC' %>"
+hostname="<%= @host.shortname %>"
+domain="<%= @host.domain %>"
+root_pass="<%= root_pass %>"
+ntp_server="<%= @host.params['ntp-server'] || '0.pfsense.pool.ntp.org' %>"
+mediapath="<%= @mediapath %>"
+osmajor="<%= @host.operatingsystem.major %>"
+osminor="<%= @host.operatingsystem.minor %>"
+osarch="<%= @host.architecture %>"
+[ "$osarch" = "x86_64" ] && osarch="amd64"
+
+# Get the disk layout, and the first disk connected to the system
+disk_layout=`/sbin/sysctl -n kern.disks | /usr/bin/sed 's/cd0 //g'`
+first_disk=${disk_layout%% *}
+first_disk="`echo $first_disk | /usr/bin/sed -e 's/ //g'`"
+test -z "$first_disk" && exit 1
+echo "Found disk: $first_disk"
+
+# Get first active NIC
+nics=`/sbin/ifconfig | /usr/bin/grep UP`
+first_nic=${nics%%:*}
+first_nic="`echo $first_nic | /usr/bin/sed -e 's/ //g'`"
+test -z "$first_nic" && exit 1
+echo "Found NIC: $first_nic"
+
+ntpdate <%= @host.params['ntp-server'] || '0.pfsense.pool.ntp.org' %>
+
+# destroy old data
+/sbin/zpool list -H | while read zpool i; do
+  /sbin/zpool destroy -f $zpool
+done
+/sbin/gpart destroy -F $first_disk
+/root/bin/destroygeom -d $first_disk || exit 1
+
+# fetch pfsense image
+/usr/bin/fetch -a -o /tmp/pfsense.img.gz ${mediapath}/pfSense-memstick-${osmajor}.${osminor}-RELEASE-${osarch}.img.gz || exit 1
+/usr/bin/gunzip -f /tmp/pfsense.img.gz || exit 1
+
+# mount image
+memdisk="`/sbin/mdconfig -f /tmp/pfsense.img || echo ERR`"
+echo "Memory disk: $memdisk"
+test -z "$memdisk" && exit 1
+[ "$memdisk" == "ERR" ] && exit 1
+mkdir /img || exit 1
+mount /dev/${memdisk}a /img
+cp /etc/resolv.conf /img/etc/
+cp /etc/resolv.conf /img/tmp/
+
+# mount devfs
+/sbin/mount -t devfs devfs /img/dev
+
+# ---------------------- patchset for pfSense installer ---------------------
+
+/bin/mkdir /img/tmp/pfsense_patches
+/bin/cat << "PATCH_1" >/img/tmp/pfsense_patches/patch-100_confirm_basic_install.lua
+--- /usr/local/share/dfuibe_lua/easy_install/100_confirm_basic_install.lua.orig	2014-06-20 19:23:55.000000000 +0200
++++ /usr/local/share/dfuibe_lua/easy_install/100_confirm_basic_install.lua	2014-07-24 16:42:44.399988313 +0200
+@@ -9,17 +9,7 @@
+     name = _("Confirmation Message"),
+     effect = function(step)
+ 
+-		if App.ui:confirm(_(
+-			"Easy Install will automatically install without asking any questions. \n\n" ..
+-			"WARNING: This will erase all contents in your first hard disk! "	..
+-			"This action is irreversible. Do you really want to continue?\n\n"	..
+-			"If you wish to have more control on your setup, "			..
+-			"choose Custom Installation from the Main Menu."
+-		)) then
+ 			return step:next()
+-		else
+-			return step:prev()
+-		end
+ 
+     end
+ }
+PATCH_1
+/bin/cat << "PATCH_2" >/img/tmp/pfsense_patches/patch-597_install_kernel.lua
+--- /usr/local/share/dfuibe_lua/easy_install/597_install_kernel.lua.orig	2014-06-20 19:23:55.000000000 +0200
++++ /usr/local/share/dfuibe_lua/easy_install/597_install_kernel.lua	2014-07-24 16:45:17.879990128 +0200
+@@ -13,34 +13,11 @@
+     req_state = { "storage" },
+     effect = function(step)
+ 	local datasets_list = {}
+-	
+-	local response = App.ui:present({
+-	    id = "install_kernel",
+-	    name = _("Install Kernel"),
+-	    short_desc = _(
+-		"You may now wish to install a custom Kernel configuration. ",
+-		App.conf.product.name, App.conf.product.name),
+-	    long_desc = _(
+-	        "",
+-		App.conf.product.name
+-	    ),
+-	    special = "bsdinstaller_install_kernel",
+ 
+-	    actions = {
+-		{
+-		    id = "SMP",
+-		    name = _("Standard Kernel")
+-		},
+-		{
+-		    id = "Embedded",
+-		    name = _("Embedded kernel (no VGA console, keyboard")
+-		}
+-	    },
+-
+-	    datasets = datasets_list,
+-	    multiple = "true",
+-	    extensible = "false"
+-	})
++	local response = {
++		action_id = "SMP",
++		name = _("Standard Kernel")
++	}
+ 
+ 	if response.action_id == "SMP" then
+ 		local cmds = CmdChain.new()
+PATCH_2
+/bin/cat << "PATCH_3" >/img/tmp/pfsense_patches/patch-cmdchain.lua
+--- /usr/local/share/dfuibe_lua/lib/cmdchain.lua.orig	2014-04-30 19:16:33.000000000 +0200
++++ /usr/local/share/dfuibe_lua/lib/cmdchain.lua	2014-07-24 16:44:16.311989400 +0200
+@@ -314,62 +314,9 @@
+ 			msg = "FAILED with a return code of " .. tostring(result) .. "."
+ 		end
+ 		
+-		while not done_interruption do
+-			App.ui:present({
+-			    id = "cancelled",
+-			    name = "Cancelled",
+-			    short_desc = "Execution of the command\n\n" ..
+-				cmd.display_cmdline .. "\n\n" .. msg,
+-			    actions = {
+-				{
+-				    id = "view_log",
+-				    name = "View Log",
+-				    short_desc = "View the command output that led up to this",
+-				    effect = function()
+-					App.view_log()
+-				    end
+-				},
+-				{
+-				    -- XXX only show if network is connected?
+-				    id = "mail_log",
+-				    name = "Mail Log",
+-				    short_desc = "Mail the failing command output to an e-mail address",
+-				    effect = function()
+-					mail_log()
+-				    end
+-				},
+-				{
+-				    id = "retry",
+-				    name = "Retry",
+-				    short_desc = "Try executing this command again",
+-				    effect = function()
+-					done_interruption = true
+-				    end
+-				},
+-				{
+-				    id = "cancel",
+-				    name = "Cancel",
+-				    short_desc = "Abort this sequence of commands",
+-				    effect = function()
+-					result = CmdChain.RESULT_CANCELLED
+-					done_interruption = true
+-					done_command = true
+-				    end
+-				},
+-				{
+-				    id = "skip",
+-				    name = "Skip",
+-				    short_desc = "Skip this particular command and resume with the next one",
+-				    effect = function()
+-					result = CmdChain.RESULT_SKIPPED
+-					done_interruption = true
+-					done_command = true
+-				    end
+-				}
+-			    }
+-			})
+-		end
+-	
++		result = CmdChain.RESULT_SKIPPED
++		done_command = true
++
+ 		return done_command, result
+ 	end
+ 
+PATCH_3
+/bin/cat << "PATCH_4" >/img/tmp/pfsense_patches/patch-lua_installer
+--- /scripts/lua_installer.orig	2014-06-20 19:23:55.000000000 +0200
++++ /scripts/lua_installer	2014-07-24 16:39:53.947986297 +0200
+@@ -151,5 +151,4 @@
+ echo ${product} is now rebooting.
+ echo
+ 
+-reboot
+ 
+PATCH_4
+/bin/cat << "PATCH_5" >/img/tmp/pfsense_patches/patch-main.lua
+--- /usr/local/share/dfuibe_lua/main.lua.orig	2014-04-30 19:16:33.000000000 +0200
++++ /usr/local/share/dfuibe_lua/main.lua	2014-07-24 16:41:59.459987781 +0200
+@@ -157,25 +157,7 @@
+ -- These are termed "pre-install tasks" even though that is a slight
+ -- misnomer (and an unfortunate acronym):
+ --
+-App.descend("pit")
+-
+-if not App.state.do_reboot and not App.state.do_exit then
+-	--
+-	-- Show the Main Menu.
+-	--
+-	Menu.new{
+-	    id = "main",
+-	    name = _("Select Task"),
+-	    short_desc = _("Choose one of the following tasks to perform."),
+-	    continue_constraint = function(result)
+-		if App.state.do_reboot or App.state.do_exit then
+-			return Menu.DONE
+-		else
+-			return result
+-		end
+-	    end
+-	}:populate("."):loop()
+-end
++App.descend("easy_install")
+ 
+ --
+ -- If there is a target system mounted, unmount it before leaving.
+@@ -192,7 +174,7 @@
+ 
+ if App.state.do_reboot then
+ 	-- exit with reboot code
+-	os.exit(5)
++	os.exit(0)
+ else
+ 	os.exit(0)
+ end
+PATCH_5
+/bin/cat << "PATCH_6" >/img/tmp/pfsense_patches/patch-target_system_ui.lua
+--- /usr/local/share/dfuibe_lua/lib/target_system_ui.lua.orig	2014-04-30 19:16:33.000000000 +0200
++++ /usr/local/share/dfuibe_lua/lib/target_system_ui.lua	2014-07-24 16:47:19.211991562 +0200
+@@ -626,25 +626,8 @@
+ 
+ TargetSystemUI.ask_reboot = function(tab)
+ 	local cancel_desc = tab.cancel_desc
+-	local response = App.ui:present{
+-	    id = "reboot",
+-	    name = _("Reboot"),
+-	    short_desc = _("This machine is about to be shut down. " ..
+-	        "After the machine has reached its shutdown state, " ..
+-	        "you may remove the CD from the CD-ROM drive tray " ..
+-	        "and press Enter to reboot from the HDD."),
+-	    role = "confirm",
+-	    actions = {
+-	        {
+-		    id = "ok",
+-		    name = _("Reboot"),
+-		},
+-	        {
+-		    id = "cancel",
+-		    accelerator = "ESC",
+-		    name = cancel_desc
+-		}
+-	    }
++	local response = {
++		action_id = "cancel"
+ 	}
+ 	return (response.action_id == "ok")
+ end
+PATCH_6
+
+/bin/cat << "CONFIG" >/img/tmp/pfsense_patches/config.xml
+--- /mnt/cf/conf/config.xml.orig	2014-07-29 16:49:56.000000000 +0200
++++ /mnt/cf/conf/config.xml	2014-07-29 16:51:24.000000000 +0200
+@@ -163,8 +163,8 @@
+ 	</sysctl>
+ 	<system>
+ 		<optimization>normal</optimization>
+-		<hostname>pfSense</hostname>
+-		<domain>localdomain</domain>
++		<hostname><%= @host.shortname %></hostname>
++		<domain><%= @host.domain %></domain>
+ 		<dnsserver/>
+ 		<dnsallowoverride/>
+ 		<group>
+@@ -187,15 +187,15 @@
+ 			<descr><![CDATA[System Administrator]]></descr>
+ 			<scope>system</scope>
+ 			<groupname>admins</groupname>
+-			<password>$1$dSJImFph$GvZ7.1UbuWu.Yb8etC0re.</password>
++			<password><%= root_pass %></password>
+ 			<uid>0</uid>
+ 			<priv>user-shell-access</priv>
+ 		</user>
+ 		<nextuid>2000</nextuid>
+ 		<nextgid>2000</nextgid>
+-		<timezone>Etc/UTC</timezone>
++		<timezone><%= @host.params['time-zone'] || 'Etc/UTC' %></timezone>
+ 		<time-update-interval>300</time-update-interval>
+-		<timeservers>0.pfsense.pool.ntp.org</timeservers>
++		<timeservers><%= @host.params['ntp-server'] || '0.pfsense.pool.ntp.org' %></timeservers>
+ 		<webgui>
+ 			<protocol>https</protocol>
+ 			<noautocomplete/>
+@@ -239,23 +239,6 @@
+ 			</wireless>
+ 			-->
+ 		</wan>
+-		<lan>
+-			<enable/>
+-			<if>vr0</if>
+-			<ipaddr>192.168.1.1</ipaddr>
+-			<subnet>24</subnet>
+-			<ipaddrv6>track6</ipaddrv6>
+-			<subnetv6>64</subnetv6>
+-			<media></media>
+-			<mediaopt></mediaopt>
+-			<track6-interface>wan</track6-interface>
+-			<track6-prefix-id>0</track6-prefix-id>
+-			<!--
+-			<wireless>
+-				*see below (opt[n])*
+-			</wireless>
+-			-->
+-		</lan>
+ 		<!--
+ 		<opt[n]>
+ 			<enable/>
+CONFIG
+
+/bin/cat << "PFSENSEPKG" >/img/tmp/pfsense_pkg
+#!/usr/local/bin/php -q
+<?php
+
+$pkg_interface = 'console';
+
+require_once("/etc/inc/config.inc");
+require_once("/etc/inc/config.lib.inc");
+require_once("/etc/inc/util.inc");
+require_once("/etc/inc/pfsense-utils.inc");
+require_once("/etc/inc/pkg-utils.inc");
+
+// get params
+$params = $_GET;
+if ( empty($params['pkg']) or empty($params['action']) ) {
+  echo "[ERROR] Missing parameters\n";
+  exit(1);
+}
+$pkgid = $params['pkg'];
+
+// validate params
+switch ($params['action']) {
+  case "install":
+    $status = install_package($pkgid);
+    if($status == -1) {
+      echo "[ERROR] Installation of \"$pkgid\" failed.\n";
+      exit(1);
+    } else {
+      echo "Installation of \"$pkgid\" completed.\n";
+      exit;
+    }
+    break;
+  case "deinstall":
+    $status = uninstall_package($pkgid);
+    if($status == -1) {
+      echo "[ERROR] Deinstallation of \"$pkgid\" failed.\n";
+      exit(1);
+    } else {
+      echo "Deinstallation of \"$pkgid\" completed.\n";
+      exit;
+    }
+    break;
+  default:
+    echo "[ERROR] Invalid action specified\n";
+    exit(1);
+}
+
+exit;
+?>
+PFSENSEPKG
+
+# ----------------------------- setup wrapper script ------------------------
+
+/bin/cat << WRAPPER >/img/tmp/install_pfsense.sh
+#!/bin/sh
+
+error() {
+  echo "[ERROR] Installation failed"
+  exit 1
+}
+
+# apply installer patches
+for i in /tmp/pfsense_patches/patch-*; do
+  patch -p0 -l < \$i
+  [ "\$?" -gt "0" ] && error
+done
+
+# launch pfSense installer
+/scripts/lua_installer
+[ "\$?" -gt "0" ] && error
+
+# mount pfSense installation
+if ! /sbin/mount | /usr/bin/grep "/dev/${first_disk}s1a" >/dev/null; then
+  /sbin/mount /dev/${first_disk}s1a /mnt || error
+fi
+
+# setup minimal configuration
+cp /tmp/resolv.conf /mnt/etc/
+patch -p0 -l < /tmp/pfsense_patches/config.xml || error
+
+# configure dns
+/usr/bin/grep '^nameserver ' /tmp/resolv.conf | awk '{print \$2}' | while read ns; do
+  /usr/bin/sed -i '' "s@</system>@<dnsserver>\$ns</dnsserver></system>@" /mnt/cf/conf/config.xml || error
+done
+/usr/bin/sed -i '' "s@<dnsserver/>@@" /mnt/cf/conf/config.xml || error
+/usr/bin/sed -i '' "s@</system>@<dnslocalhost/></system>@" /mnt/cf/conf/config.xml || error
+
+# fix WAN interface name
+/usr/bin/sed -i '' "s@<if>vr1</if>@<if>${first_nic}</if>@g" /mnt/cf/conf/config.xml || error
+test -s /mnt/cf/conf/config.xml || error
+
+# skip setup wizard
+rm -f /mnt/cf/conf/trigger_initial_wizard || error
+
+# Quirk: fix different P-ATA device names in FreeBSD 8 vs. FreeBSD 10
+if echo "$first_disk" | /usr/bin/grep '^ada[0-9]*$' >/dev/null; then
+  echo "Fixing P-ATA device names in /etc/fstab"
+  /usr/bin/sed -i '' 's/ada/ad/g' /mnt/etc/fstab || error
+fi
+
+# fix /conf symlink
+/bin/mv /mnt/conf/mtree.log /mnt/cf/conf/
+rm -rf /mnt/conf
+chroot /mnt /bin/ln -s /cf/conf /
+
+# save pfsense package wrapper
+mv /tmp/pfsense_pkg /mnt/usr/local/sbin/pfsense_pkg
+chmod 755 /mnt/usr/local/sbin/pfsense_pkg
+
+# save finish script for later exec
+mv /tmp/finish.sh /mnt/etc/rc.foreman
+chmod 755 /mnt/etc/rc.foreman
+
+# activate finish script
+/usr/bin/sed -i '' "s@</system>@<shellcmd>/bin/sh /etc/rc.foreman</shellcmd></system>@g" /mnt/cf/conf/config.xml || error
+
+# dont block private networks
+/usr/bin/sed -i '' "s@<blockpriv/>@@g" /mnt/cf/conf/config.xml || exit 1
+
+# enable ssh access
+/usr/bin/sed -i '' "s@</system>@<enablesshd/></system>@g" /mnt/cf/conf/config.xml || exit 1
+
+# move puppet ssl files to pfSense installation
+mkdir -p /mnt/var/puppet/ssl/public_keys /mnt/var/puppet/ssl/private_keys /mnt/var/puppet/ssl/certificate_requests /mnt/var/puppet/ssl/certs || exit 1
+mv /tmp/ca.pem /mnt/var/puppet/ssl/certs/ca.pem || exit 1
+mv /tmp/private_key.pem /mnt/var/puppet/ssl/private_keys/<%= @host %>.pem || exit 1
+mv /tmp/public_key.pem /mnt/var/puppet/ssl/public_keys/<%= @host %>.pem || exit 1
+mv /tmp/request.csr /mnt/var/puppet/ssl/certificate_requests/<%= @host %>.pem || exit 1
+mv /tmp/cert.pem /mnt/var/puppet/ssl/certs/<%= @host %>.pem || exit 1
+chown -R 814:814 /mnt/var/puppet || exit 1
+
+/sbin/umount /dev/${first_disk}s1a
+
+exit 0
+WRAPPER
+
+# ----------------------------- run pfSense installer ------------------------
+
+#
+# puppet certificate
+#
+
+# install cURL
+/usr/bin/fetch -o /tmp/curl.txz http://pkg.freebsd.org/freebsd:10:x86:64/release/0/All/curl-7.33.0_1.txz || exit 1
+/usr/bin/fetch -o /tmp/ca_root_nss.txz http://pkg.freebsd.org/freebsd:10:x86:64/release/0/All/ca_root_nss-3.15.3.1.txz || exit 1
+/usr/sbin/pkg add /tmp/ca_root_nss.txz /tmp/curl.txz || exit 1
+
+# save CA cert
+/usr/local/bin/curl -o /img/tmp/ca.pem -k -H "Accept: s" https://<%= @host.puppetmaster %>:8140/<%= @host.environment %>/certificate/ca  || exit 1
+
+# generate keys and CSR
+/usr/bin/openssl genrsa -out /img/tmp/private_key.pem 4096 || exit 1
+/usr/bin/openssl rsa -in /img/tmp/private_key.pem -pubout -out /img/tmp/public_key.pem || exit 1
+/usr/bin/openssl req -new -key /img/tmp/private_key.pem -subj "/CN=<%= @host %>" -out /img/tmp/request.csr || exit 1
+
+# upload CSR
+/usr/local/bin/curl -k -X PUT -H "Content-Type: text/plain" --data-binary @/img/tmp/request.csr  https://<%= @host.puppetmaster %>:8140/<%= @host.environment %>/certificate_request/<%= @host %> || exit 1
+
+# save certificate
+/usr/local/bin/curl -o /img/tmp/cert.pem -k -H "Accept: s" https://<%= @host.puppetmaster %>:8140/<%= @host.environment %>/certificate/<%= @host %> || exit 1
+
+# remove cURL
+/usr/sbin/pkg delete -fy curl ca_root_nss
+
+#
+# pfSense installation
+#
+
+# fetch finish script
+/usr/bin/fetch -q --no-verify-hostname --no-verify-peer -o /img/tmp/finish.sh "<%= foreman_url('finish') %>" || exit 1
+/bin/chmod +x /img/tmp/finish.sh
+
+# run wrapper script
+chmod 755 /img/tmp/install_pfsense.sh
+chroot /img /tmp/install_pfsense.sh
+if [ "$?" -gt "0" ]; then
+  echo "[ERROR] Installation failed"
+else
+  fetch -q --no-verify-hostname --no-verify-peer -o /dev/null "<%= foreman_url %>"
+  echo "Installation succeeded."
+  umount /img/dev
+  umount -f /img
+  shutdown -r +1&
+fi
+

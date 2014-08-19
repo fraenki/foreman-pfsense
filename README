@@ -1,0 +1,27 @@
+ABOUT
+-----------------------------------------------------------------------
+Automatically provision new pfSense firewalls with The Foreman.
+Tested with pfSense 2.1.3 and 2.1.4, needs further testing on pfSense 2.2.
+
+Should be used in conjunction with the pfSense puppet provider:
+https://github.com/fraenki/puppet-pfsense
+
+
+REQUIREMENTS / USAGE
+-----------------------------------------------------------------------
+- get The Foreman from http://theforeman.org/ :-)
+- get the required FreeBSD provisioning files (customized mfsBSD):
+  http://projects.theforeman.org/projects/foreman/wiki/FreeBSD
+- add pfSense operatingsystem and desired version(s) to foreman 
+  (use 2 as major and 1.4 as minor version number)
+- recommended: create a local mirror for the pfSense memstick image(s)
+
+
+DRAWBACKS
+-----------------------------------------------------------------------
+- puppet is not yet available from the official pfSense repository:
+  https://forum.pfsense.org/index.php?topic=79397.0
+- pfSense 2.1 (FreeBSD 8.x) does not natively support VirtIO devices
+- pfSense version numbers are not well supported in The Foreman
+- pfSense is not yet recognized as a distribution, but instead listed as FreeBSD
+- possible bug in KVM virtualization (coredump on first boot)
