@@ -19,9 +19,10 @@ REQUIREMENTS / USAGE
 
 DRAWBACKS
 -----------------------------------------------------------------------
+- requires 1 GB RAM to store all required files in memory
 - puppet is not yet available from the official pfSense repository:
   https://forum.pfsense.org/index.php?topic=79397.0
 - pfSense 2.1 (FreeBSD 8.x) does not natively support VirtIO devices
 - pfSense version numbers are not well supported in The Foreman
 - pfSense is not yet recognized as a distribution, but instead listed as FreeBSD
-- possible bug in KVM virtualization (coredump on first boot)
+- possible bug in KVM virtualization due to ancient FreeBSD version (coredump on first boot)
