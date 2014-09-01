@@ -17,9 +17,8 @@ osarch="<%= @host.architecture %>"
 [ "$osarch" = "x86_64" ] && osarch="amd64"
 
 # Get the disk layout, and the first disk connected to the system
-disk_layout=`/sbin/sysctl -n kern.disks | /usr/bin/sed 's/cd0 //g'`
-first_disk=${disk_layout%% *}
-first_disk="`echo $first_disk | /usr/bin/sed -e 's/ //g'`"
+disk_layout=`/sbin/sysctl -n kern.disks | /usr/bin/sed 's/cd[0-9]//g'`
+first_disk="`echo ${disk_layout##*[1-9]} | /usr/bin/cut -d' ' -f1`"
 test -z "$first_disk" && exit 1
 echo "Found disk: $first_disk"
 
